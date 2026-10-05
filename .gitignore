@@ -1,0 +1,30 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据集（体积大, 不入库）
+datasets/
+data/
+/content/
+
+# 模型权重与导出（预训练权重、训练结果、ONNX）
+*.pt
+*.pth
+*.onnx
+*.engine
+*.mlpackage
+
+# 训练/验证输出
+runs/
+wandb/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 系统文件
+.DS_Store
+Thumbs.db
