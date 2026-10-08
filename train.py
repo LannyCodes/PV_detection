@@ -92,9 +92,10 @@ def main():
         return
     print(f"最佳权重: {best}")
 
-    # 用最佳权重在验证集上评估
+    # 用最佳权重在验证集上评估 (多卡训练后验证锁单卡, 避免多卡 val 的兼容性风险)
+    val_device = str(device).split(",")[0] if "," in str(device) else device
     best_model = YOLO(str(best))
-    metrics = best_model.val(data=str(data), device=device)
+    metrics = best_model.val(data=str(data), device=val_device)
     if getattr(metrics, "box", None) is not None:
         print(f"验证集: mAP50={metrics.box.map50:.4f}  mAP50-95={metrics.box.map:.4f}")
 

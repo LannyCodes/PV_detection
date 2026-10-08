@@ -9,6 +9,7 @@ train_seg.py — HRNet 语义分割训练 (板面分割 / 缺陷分割通用)
     python seg/train_seg.py --data seg/datasets/panel_seg
     python seg/train_seg.py --data seg/datasets/panel_seg --arch w32 --imgsz 512 --epochs 100
     python seg/train_seg.py --data seg/datasets/panel_seg --resume        # 断点续训
+    torchrun --standalone --nproc_per_node=2 seg/train_seg.py --data seg/datasets/panel_seg --batch 6   # 双卡 DDP (--batch 为每卡 batch)
 
 输出 (project/name/, 默认 runs/pv_seg/train/):
     best.pt         验证 mIoU 最优权重 (含类别表, 供级联推理加载)
@@ -21,6 +22,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -28,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
@@ -71,7 +74,7 @@ def parse_args():
 def pick_device(arg: str):
     """自动选择训练设备 (与 train.py 同一策略)"""
     if arg != "auto":
-        return arg
+        return int(arg) if str(arg).isdigit() else arg
     if torch.cuda.is_available():
         return 0
     mps = getattr(torch.backends, "mps", None)
@@ -261,33 +264,59 @@ def main():
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     classes = meta.get("classes", {"0": "background"})
     num_classes = max(int(k) for k in classes) + 1
-    print(f"数据集: {data_root} | 类别 {num_classes} 个: {classes}")
+
+    # 多卡: 通过 torchrun --nproc_per_node=N 启动时自动启用 DDP (LOCAL_RANK 由 torchrun 注入)
+    ddp = "LOCAL_RANK" in os.environ
+    if ddp:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        world_size = dist.get_world_size()
+        is_main = dist.get_rank() == 0
+        device = local_rank
+    else:
+        world_size, is_main, device = 1, True, pick_device(args.device)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = pick_device(args.device)
-    use_amp = device == 0
+    use_amp = isinstance(device, int)  # CUDA (含 DDP 各卡) 启用 AMP
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    print(f"PyTorch {torch.__version__} | device={device} | AMP={'on' if use_amp else 'off'}")
+    if is_main:
+        print(f"数据集: {data_root} | 类别 {num_classes} 个: {classes}")
+        print(f"PyTorch {torch.__version__} | device={device} | world_size={world_size} | "
+              f"AMP={'on' if use_amp else 'off'}")
 
     train_set = SegDataset(data_root, "train", args.imgsz, augment=True)
     val_set = SegDataset(data_root, "val", args.imgsz, augment=False)
-    train_loader = DataLoader(
-        train_set, batch_size=args.batch, shuffle=True,
-        num_workers=args.workers, pin_memory=(device == 0),
-        drop_last=len(train_set) >= args.batch,
-    )
-    val_loader = DataLoader(
-        val_set, batch_size=max(1, args.batch // 2), shuffle=False,
-        num_workers=args.workers, pin_memory=(device == 0),
-    )
-    print(f"train: {len(train_set)} 张 | val: {len(val_set)} 张")
+    train_sampler = None
+    if ddp:
+        train_sampler = torch.utils.data.DistributedSampler(train_set, shuffle=True)
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch, sampler=train_sampler,
+            num_workers=args.workers, pin_memory=True,
+            drop_last=len(train_set) >= args.batch * world_size,
+        )
+    else:
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch, shuffle=True,
+            num_workers=args.workers, pin_memory=(device == 0),
+            drop_last=len(train_set) >= args.batch,
+        )
+    # 验证只在主进程执行 (val_loader 仅主进程构建)
+    val_loader = None
+    if is_main:
+        val_loader = DataLoader(
+            val_set, batch_size=max(1, args.batch // 2), shuffle=False,
+            num_workers=args.workers, pin_memory=(device == 0),
+        )
+        print(f"train: {len(train_set)} 张 | val: {len(val_set)} 张 | 每卡 batch={args.batch} | 全局 batch={args.batch * world_size}")
 
     model = build_hrnet(args.arch, num_classes).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"模型: HRNet-{args.arch.upper()} ({n_params:.1f}M 参数)")
+    if is_main:
+        print(f"模型: HRNet-{args.arch.upper()} ({n_params:.1f}M 参数)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = ComboLoss(num_classes)
@@ -305,66 +334,90 @@ def main():
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         best_miou = ckpt.get("best_miou", -1.0)
-        print(f"已加载 {ckpt_last}, 从 epoch {start_epoch + 1} 继续 (best mIoU={best_miou:.4f})")
-    if start_epoch >= args.epochs:
+        if is_main:
+            print(f"已加载 {ckpt_last}, 从 epoch {start_epoch + 1} 继续 (best mIoU={best_miou:.4f})")
+
+    if ddp:
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+    if start_epoch >= args.epochs and is_main:
         print(f"提示: 已完成 {start_epoch} 轮 >= 目标轮数 {args.epochs}, 如需继续请调大 --epochs")
 
-    save_dir.mkdir(parents=True, exist_ok=True)
-    log_path = save_dir / "results.csv"
-    log_file = open(log_path, "a" if args.resume else "w", newline="", encoding="utf-8")
-    writer = csv.writer(log_file)
-    if not args.resume:
-        writer.writerow(["epoch", "lr", "train_loss", "val_loss", "mIoU", "pixel_acc"])
+    log_file, writer = None, None
+    if is_main:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        log_path = save_dir / "results.csv"
+        log_file = open(log_path, "a" if args.resume else "w", newline="", encoding="utf-8")
+        writer = csv.writer(log_file)
+        if not args.resume:
+            writer.writerow(["epoch", "lr", "train_loss", "val_loss", "mIoU", "pixel_acc"])
 
     palette = build_palette(classes)
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         lr_now = set_learning_rate(optimizer, args.lr, epoch, args.epochs, args.warmup)
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, use_amp, scaler)
-        miou, pix_acc, per_class, val_loss = evaluate(model, val_loader, num_classes, device, use_amp)
+
+        # 验证与日志只在主进程执行; 下一轮训练开头的 DDP allreduce 会隐式同步其余 rank
+        if is_main:
+            miou, pix_acc, per_class, val_loss = evaluate(model, val_loader, num_classes, device, use_amp)
+            miou_t = torch.tensor([miou], device=device)
+        else:
+            miou_t = torch.tensor([0.0], device=device)
+        if ddp:
+            dist.broadcast(miou_t, src=0)  # 广播指标, 保证各 rank 的早停决策一致
+        miou = miou_t.item()
 
         improved = miou > best_miou
         if improved:
             best_miou, patience_cnt = miou, 0
         else:
             patience_cnt += 1
-        writer.writerow([epoch + 1, f"{lr_now:.6f}", f"{train_loss:.4f}",
-                         f"{val_loss:.4f}", f"{miou:.4f}", f"{pix_acc:.4f}"])
-        log_file.flush()
-        flag = " *best*" if improved else ""
-        print(f"[{epoch + 1}/{args.epochs}] lr={lr_now:.5f} loss={train_loss:.4f} val_loss={val_loss:.4f} "
-              f"mIoU={miou:.4f} acc={pix_acc:.4f}{flag} {time.time() - t0:.0f}s")
-        if improved:
-            iou_str = " ".join(f"{classes.get(str(cid), cid)}:{v:.3f}" for cid, v in sorted(per_class.items()))
-            print(f"    各类 IoU: {iou_str}")
 
-        state = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "epoch": epoch,
-            "best_miou": best_miou,
-            "arch": args.arch,
-            "num_classes": num_classes,
-            "classes": classes,
-            "imgsz": args.imgsz,
-        }
-        torch.save(state, ckpt_last)
-        if improved:
-            torch.save(state, ckpt_best)
+        if is_main:
+            writer.writerow([epoch + 1, f"{lr_now:.6f}", f"{train_loss:.4f}",
+                             f"{val_loss:.4f}", f"{miou:.4f}", f"{pix_acc:.4f}"])
+            log_file.flush()
+            flag = " *best*" if improved else ""
+            print(f"[{epoch + 1}/{args.epochs}] lr={lr_now:.5f} loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                  f"mIoU={miou:.4f} acc={pix_acc:.4f}{flag} {time.time() - t0:.0f}s")
+            if improved:
+                iou_str = " ".join(f"{classes.get(str(cid), cid)}:{v:.3f}" for cid, v in sorted(per_class.items()))
+                print(f"    各类 IoU: {iou_str}")
+
+            state = {
+                "model": (model.module if ddp else model).state_dict(),  # 存原始结构, 供单卡/推理加载
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "best_miou": best_miou,
+                "arch": args.arch,
+                "num_classes": num_classes,
+                "classes": classes,
+                "imgsz": args.imgsz,
+            }
+            torch.save(state, ckpt_last)
+            if improved:
+                torch.save(state, ckpt_best)
 
         if args.patience > 0 and patience_cnt >= args.patience:
-            print(f"早停: 连续 {args.patience} 轮 mIoU 无提升")
+            if is_main:
+                print(f"早停: 连续 {args.patience} 轮 mIoU 无提升")
             break
 
-    log_file.close()
-    print(f"\n训练结束: 最佳 mIoU={best_miou:.4f}")
-    print(f"权重: {ckpt_best} | 日志: {log_path}")
-
-    if ckpt_best.exists():
-        ckpt = torch.load(ckpt_best, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
-        save_predictions(model, val_set, device, save_dir / "predictions", palette)
+    if is_main:
+        log_file.close()
+        print(f"\n训练结束: 最佳 mIoU={best_miou:.4f}")
+        print(f"权重: {ckpt_best} | 日志: {log_path}")
+        if ckpt_best.exists():
+            ckpt = torch.load(ckpt_best, map_location="cpu")
+            net = model.module if ddp and hasattr(model, "module") else model
+            net.load_state_dict(ckpt["model"])
+            save_predictions(net, val_set, device, save_dir / "predictions", palette)
+    if ddp:
+        dist.barrier()  # 等主进程完成预测可视化后再统一退出
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
