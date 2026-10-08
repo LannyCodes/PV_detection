@@ -3,6 +3,7 @@ predict_cascade.py — 级联推理: YOLO 缺陷检测 + HRNet 板面分割
 
 流程 (逐张):
   1. HRNet 对整图做板面分割            -> 板面 mask
+     (默认形态学后处理: 去小噪块/填内部洞/微膨胀, --no-mask-post 关闭)
   2. YOLO 检测缺陷框                   -> 类别 + 置信度 + 坐标
   3. 融合: 计算每个框内"板面像素占比"
        - 占比 >= --min-panel-ratio   -> 判定为板上缺陷
@@ -22,6 +23,8 @@ predict_cascade.py — 级联推理: YOLO 缺陷检测 + HRNet 板面分割
     - 本脚本是级联管线第一步: 用板面 mask 过滤背景误检;
       缺陷像素级分割 (HRNet-2) 接入后可进一步输出缺陷面积占比
     - 板面判据: 非背景像素即视为板面 (板面分割为二值任务)
+    - mask 后处理: --min-blob-ratio (小连通域阈值, 默认 0.05% 图像面积),
+      --dilate-px (膨胀像素, 默认 3), 提升 mask 完整性与判定稳健性
 """
 
 import argparse
@@ -29,6 +32,7 @@ import csv
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -58,6 +62,9 @@ def parse_args():
     p.add_argument("--conf", type=float, default=0.25, help="YOLO 置信度阈值")
     p.add_argument("--iou", type=float, default=0.7, help="YOLO NMS IoU 阈值")
     p.add_argument("--min-panel-ratio", type=float, default=0.5, help="框内板面占比判定阈值")
+    p.add_argument("--no-mask-post", action="store_true", help="关闭板面 mask 后处理 (去噪/填洞/膨胀)")
+    p.add_argument("--min-blob-ratio", type=float, default=0.0005, help="mask 小连通域过滤阈值 (占图像面积比例)")
+    p.add_argument("--dilate-px", type=int, default=3, help="mask 膨胀像素数 (边缘补偿)")
     p.add_argument("--drop-background", action="store_true", help="直接丢弃疑似背景误检框 (默认仅标记)")
     p.add_argument("--limit", type=int, default=0, help="最多处理多少张 (0=全部)")
     p.add_argument("--device", default="auto", help="auto / 0 / cpu / mps")
@@ -120,6 +127,42 @@ def segment_panel(model, img: Image.Image, imgsz: int, device, num_classes: int)
     return pred > 0  # 非背景 = 板面 (二值任务)
 
 
+def postprocess_mask(fg: np.ndarray, min_blob_ratio: float = 0.0005, dilate_px: int = 3) -> np.ndarray:
+    """mask 形态学后处理: 去小噪块 -> 填内部洞 -> 微膨胀 (边缘补偿)
+
+    - 去小连通域: 面积 < min_blob_ratio * 图像面积 的孤立碎块视为噪点删除
+    - 填内部洞: 未与图像边界连通的背景区域视为漏检空洞, 补为板面
+    - 膨胀: 外扩 dilate_px 像素, 补偿分割边缘的系统性缩水
+    """
+    m = fg.astype(np.uint8)
+
+    # 1) 去小连通域
+    if min_blob_ratio > 0:
+        min_area = max(1.0, min_blob_ratio * m.shape[0] * m.shape[1])
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        keep = np.zeros_like(m)
+        for i in range(1, n):  # 0 是背景标签
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                keep[labels == i] = 1
+        m = keep
+
+    # 2) 填内部洞 (从边界 floodfill 外部背景, 涂不到的背景即内部洞)
+    if m.any():
+        padded = np.pad(m, 1, mode="constant")
+        ff = padded.copy()
+        ff_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+        cv2.floodFill(ff, ff_mask, (0, 0), 2)
+        m = ((padded == 1) | (ff == 0))[1:-1, 1:-1].astype(np.uint8)
+
+    # 3) 微膨胀 (椭圆核, 半径 dilate_px)
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        m = cv2.dilate(m, kernel)
+
+    return m.astype(bool)
+
+
 def box_panel_ratio(fg: np.ndarray, box) -> float:
     """框内板面像素占比 (0~1)"""
     h, w = fg.shape
@@ -180,7 +223,8 @@ def main():
     print(f"PyTorch {torch.__version__} | device={device}")
 
     seg_model, classes, arch, num_classes, imgsz_seg = load_seg_model(seg_weights, device, args.imgsz_seg)
-    print(f"分割: HRNet-{arch.upper()} | 类别 {classes} | imgsz={imgsz_seg}")
+    post_desc = "关" if args.no_mask_post else f"开 (min_blob={args.min_blob_ratio}, dilate={args.dilate_px}px)"
+    print(f"分割: HRNet-{arch.upper()} | 类别 {classes} | imgsz={imgsz_seg} | mask后处理: {post_desc}")
     det_model = YOLO(str(det_weights))
     print(f"检测: {det_weights.name} | 类别 {det_model.names} | imgsz={args.imgsz_det}")
     print(f"待处理: {len(images)} 张 -> {out_dir}\n")
@@ -190,6 +234,8 @@ def main():
     for i, img_path in enumerate(images, 1):
         img = Image.open(img_path).convert("RGB")
         fg = segment_panel(seg_model, img, imgsz_seg, device, num_classes)
+        if not args.no_mask_post:
+            fg = postprocess_mask(fg, args.min_blob_ratio, args.dilate_px)
 
         result = det_model.predict(
             str(img_path), imgsz=args.imgsz_det, conf=args.conf, iou=args.iou,
