@@ -361,7 +361,10 @@ def main():
 
         # 验证与日志只在主进程执行; 下一轮训练开头的 DDP allreduce 会隐式同步其余 rank
         if is_main:
-            miou, pix_acc, per_class, val_loss = evaluate(model, val_loader, num_classes, device, use_amp)
+            # 评估必须用原始模型(绕过 DDP 包装): DDP 包装的 forward 在首次 eval 时会触发
+            # buffer 同步 collective, 其余 rank 跳过本段代码 → collective 序列错位, NCCL 死锁
+            eval_net = model.module if ddp else model
+            miou, pix_acc, per_class, val_loss = evaluate(eval_net, val_loader, num_classes, device, use_amp)
             miou_t = torch.tensor([miou], device=device)
         else:
             miou_t = torch.tensor([0.0], device=device)
